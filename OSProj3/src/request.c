@@ -3,10 +3,48 @@
 
 #define MAXBUF (8192)
 
-
+#define QUEUE_SIZE 100
+static int req_queue[QUEUE_SIZE];
+static int queue_head = 0, queue_tail = 0, queue_count = 0;
+static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  queue_not_empty = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  queue_not_full  = PTHREAD_COND_INITIALIZER;
 //
 //	TODO: add code to create and manage the buffer
 //
+void initialization(int nthreads) {
+    for (int i = 0; i < nthreads; i++) {
+        pthread_t new_thread;
+        pthread_create(&new_thread, NULL, fd_handler, NULL);
+    }
+}
+
+void* fd_handler(void* worker_thread) {		//use a handler to take requests from the buffer and process them
+	while(1) {
+          int fd = request_dequeue();
+          request_handle(fd);			//pass it to the handler function
+          close_or_die(fd);			//close the connection
+      }
+}
+
+int request_enqueue(int fd) {		//add function to enqueue onto a buffered queue
+    pthread_mutex_lock(&queue_mutex);	//lock implementation for the thread to request a mutex
+
+    while (queue_count == QUEUE_SIZE) {		//if the count fills the buffer, then wait until there's a free space in the buffer
+        pthread_cond_wait(&queue_not_full, &queue_mutex);
+    }
+
+    req_queue[queue_tail] = fd;			//enqueue the file descriptor at the end of the buffer
+    queue_tail = (queue_tail + 1) % QUEUE_SIZE;	//location arithmetic for circualar queue
+    queue_count += 1;				//add to count
+    pthread_cond_signal(&queue_not_empty);	//signal that the queue isn't empty
+    pthread_mutex_unlock(&queue_mutex);		//unlock the mutex
+    return 0;
+}
+
+int request_dequeue() {
+    //TODO: write function to dequeue from the buffer array
+}
 
 //
 // Sends out HTTP response in case of errors
