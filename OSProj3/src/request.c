@@ -3,49 +3,185 @@
 
 #define MAXBUF (8192)
 
-#define QUEUE_SIZE 100
-static int req_queue[QUEUE_SIZE];
-static int queue_head = 0, queue_tail = 0, queue_count = 0;
+int num_threads = DEFAULT_THREADS;
+int buffer_max_size = DEFAULT_BUFFER_SIZE;
+int scheduling_algo = DEFAULT_SCHED_ALGO;
+
 static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  queue_not_empty = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t  queue_not_full  = PTHREAD_COND_INITIALIZER;
+
+typedef struct request_node {
+    int fd;
+    struct request_node *next;
+} request_node_t;
+
+// Thread-safe queue structure
+typedef struct {
+    request_node_t *head;
+    request_node_t *tail;
+    int size;
+    int max_size;                // maximum queue size
+    pthread_mutex_t mutex;
+    pthread_cond_t not_empty;
+    pthread_cond_t not_full;
+} request_queue_t;
+
+request_queue_t request_queue;
+__attribute__((constructor)) void init_request_queue() {
+    request_queue_init(&request_queue, buffer_max_size);
+}
+
+
+// Initialize the request queue
+void request_queue_init(request_queue_t *q, int max_size) {
+    q->head = q->tail = NULL;
+    q->size = 0;
+    q->max_size = max_size;
+    pthread_mutex_init(&q->mutex, NULL);
+    pthread_cond_init(&q->not_empty, NULL);
+    pthread_cond_init(&q->not_full, NULL);
+    srand((unsigned int)time(NULL));  // seed RNG for random insertion
+}
+
 //
 //	TODO: add code to create and manage the buffer
 //
-void initialization(int nthreads) {
-    for (int i = 0; i < nthreads; i++) {
-        pthread_t new_thread;
-        pthread_create(&new_thread, NULL, fd_handler, NULL);
-    }
-}
 
-void* fd_handler(void* worker_thread) {		//use a handler to take requests from the buffer and process them
-	while(1) {
-          int fd = request_dequeue();
-          request_handle(fd);			//pass it to the handler function
-          close_or_die(fd);			//close the connection
-      }
-}
+void request_enqueue_FIFO(request_queue_t *q, int fd) {
+    request_node_t *node = malloc(sizeof(request_node_t));
+    node->fd = fd;
+    node->next = NULL;
 
-int request_enqueue(int fd) {		//add function to enqueue onto a buffered queue
-    pthread_mutex_lock(&queue_mutex);	//lock implementation for the thread to request a mutex
-
-    while (queue_count == QUEUE_SIZE) {		//if the count fills the buffer, then wait until there's a free space in the buffer
-        pthread_cond_wait(&queue_not_full, &queue_mutex);
+    pthread_mutex_lock(&q->mutex);
+    while (q->size >= q->max_size) {
+        pthread_cond_wait(&q->not_full, &q->mutex);
     }
 
-    req_queue[queue_tail] = fd;			//enqueue the file descriptor at the end of the buffer
-    queue_tail = (queue_tail + 1) % QUEUE_SIZE;	//location arithmetic for circualar queue
-    queue_count += 1;				//add to count
-    pthread_cond_signal(&queue_not_empty);	//signal that the queue isn't empty
-    pthread_mutex_unlock(&queue_mutex);		//unlock the mutex
-    return 0;
+    if (q->tail == NULL) {
+        q->head = q->tail= node;
+    }
+
+    else {
+        q->tail->next = node;
+        q->tail = node;
+    }
+
+    q->size++;
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->mutex);
 }
 
-int request_dequeue() {
-    //TODO: write function to dequeue from the buffer array
+void request_enqueue_SFF(request_queue_t *q, int fd, off_t filesize) {
+    request_node_t *node = malloc(sizeof(request_node_t));
+    node->fd = fd;
+    node->next = NULL;
+
+    pthread_mutex_lock(&q->mutex);
+    while (q->size >= q->max_size) {
+        pthread_cond_wait(&q->not_full, &q->mutex);
+    }
+
+    if (q->head == NULL) {
+        q->head = q->tail = node;
+    }
+
+    else {
+        struct stat statbuf;
+        if (fstat(q->head->fd, &statbuf) == 0 && filesize <= statbuf.st_size) {
+            node->next = q->head;
+            q->head = node;
+        }
+        
+        else {
+            request_node_t *prev = q->head;
+            request_node_t *curr = q->head->next;
+
+            while (curr != NULL) {
+                if(fstat(curr->fd, &statbuf) == -1) {
+                    statbuf.st_size = 0;
+                }
+
+                if (filesize <= statbuf.st_size) {
+                    break;
+                }
+
+                prev = curr;
+                curr = curr->next;
+            }
+
+            node->next = curr;
+            prev->next = node;
+            if (curr == NULL) {
+                q->tail = node;
+            }
+        }
+    }
+
+    q->size += 1;
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->mutex);
 }
 
+void request_enqueue_random(request_queue_t *q, int fd) {
+    request_node_t *node = malloc(sizeof(request_node_t));
+    node->fd = fd;
+    node->next = NULL;
+
+    pthread_mutex_lock(&q->mutex);
+    while (q->size >= q->max_size) {
+        pthread_cond_wait(&q->not_full, &q->mutex);
+    }
+
+    if (q->head == NULL) {
+        q->head = q->tail = node;
+    }
+
+    else {
+        int index = rand() % (q->size + 1);
+
+        if (index == 0) {
+            node->next = q->head;
+            q->head = node;
+        }
+
+        else {
+            request_node_t *curr = q->head;
+            for (int i = 1; i < index && curr->next != NULL; i++) {
+                curr = curr->next;
+            }
+
+            node->next = curr->next;
+            curr->next = node;
+            if (curr == NULL) {
+                q->tail = node;
+            }
+        }
+    }
+
+    q->size += 1;
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->mutex);
+}
+
+int dequeue(request_queue_t *q) {
+    pthread_mutex_lock(&q->mutex);
+    while (q->size == 0) {
+        pthread_cond_wait(&q->not_full, &q->mutex);
+    }
+
+    request_node_t *node = q->head;
+    int fd = node->fd;
+    if (q->head == NULL) {
+        q->tail = NULL;
+    }
+
+    q->size -= 1;
+    free(node);
+    pthread_cond_signal(&q->not_full);
+    pthread_mutex_unlock(&q->mutex);
+    return fd;
+}
 //
 // Sends out HTTP response in case of errors
 //
@@ -172,7 +308,11 @@ void request_serve_static(int fd, char *filename, int filesize) {
 //
 void* thread_request_serve_static(void* arg)
 {
-	// TODO: write code to actualy respond to HTTP requests
+    while(1) {
+        int fd = dequeue(&request_queue);
+        request_handle(fd);
+        close_or_die(fd);
+    }
 }
 
 //
@@ -183,6 +323,14 @@ void request_handle(int fd) {
     struct stat sbuf;
     char buf[MAXBUF], method[MAXBUF], uri[MAXBUF], version[MAXBUF];
     char filename[MAXBUF], cgiargs[MAXBUF];
+    request_enqueue_FIFO(&request_queue, fd);
+
+/* struct stat statbuf;
+    if (fstat(fd, &statbuf) == 0) {
+        request_enqueue_SFF(&request_queue, fd, statbuf.st_size);
+    } */
+
+    //request_enqueue_random(&request_queue, fd);
     
 	// get the request type, file path and HTTP version
     readline_or_die(fd, buf, MAXBUF);
@@ -214,6 +362,18 @@ void request_handle(int fd) {
 		
 		// TODO: write code to add HTTP requests in the buffer based on the scheduling policy
 
+        //FIFO scheduling implementation:
+        request_enqueue_FIFO(&request_queue, fd);
+
+        //SFF scheduling implementation:
+/*      struct stat statbuf;
+        if (fstat(fd, &statbuf) == 0) {
+            request_enqueue_SFF(&request_queue, fd, statbuf.st_size);
+        } */
+
+        //Random scheduling implementation:
+        //request_enqueue_random(&request_queue, fd);
+            
     } else {
 		request_error(fd, filename, "501", "Not Implemented", "server does not serve dynamic content request");
     }
