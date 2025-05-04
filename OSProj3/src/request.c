@@ -320,10 +320,6 @@ void* thread_request_serve_static(void* arg)
     }
 }
 
-void request_handle_enqueue(int conn_fd) {
-    request_enqueue_FIFO(&request_queue, conn_fd);
-}
-
 //
 // Initial handling of the request
 //
@@ -339,13 +335,14 @@ void request_handle(int fd) {
             return;
         }
 
-        printf("Received request: %s\n", buf);
+        printf("Received raw request line: %s\n", buf);
     
         if (sscanf(buf, "%s %s %s", method, uri, version) == 3) {
             break;
         }
     }
 
+    printf("Parsed request method: %s, URI: %s, Version: %s\n", method, uri, version);
     printf("method: %s | uri: %s | version: %s\n", method, uri, version);
 
     if (strcasecmp(method, "GET")) {
@@ -377,9 +374,12 @@ void request_handle(int fd) {
 		}
 		
 		// TODO: write code to add HTTP requests in the buffer based on the scheduling policy
+        request_enqueue_FIFO(&request_queue, fd);
 
-        request_handle_enqueue(fd);
-           
+        //request_enqueue_SFF(&request_queue, fd, sbuf.st_size);
+
+        //request_enqueue_random(&request_queue, fd);
+
     } else {
 		request_error(fd, filename, "501", "Not Implemented", "server does not serve dynamic content request");
     }
