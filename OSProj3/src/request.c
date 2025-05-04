@@ -58,6 +58,8 @@ void request_enqueue_FIFO(request_queue_t *q, int fd) {
         pthread_cond_wait(&q->not_full, &q->mutex);
     }
 
+    printf("Enqueuing request: fd=%d\n", fd);
+
     if (q->tail == NULL) {
         q->head = q->tail= node;
     }
@@ -167,11 +169,14 @@ void request_enqueue_random(request_queue_t *q, int fd) {
 int dequeue(request_queue_t *q) {
     pthread_mutex_lock(&q->mutex);
     while (q->size == 0) {
-        pthread_cond_wait(&q->not_full, &q->mutex);
+        printf("Queue is empty, waiting for request...\n");
+        pthread_cond_wait(&q->not_empty, &q->mutex);
     }
 
     request_node_t *node = q->head;
     int fd = node->fd;
+
+    q->head = node->next;
     if (q->head == NULL) {
         q->tail = NULL;
     }
@@ -315,6 +320,10 @@ void* thread_request_serve_static(void* arg)
     }
 }
 
+void request_handle_enqueue(int conn_fd) {
+    request_enqueue_FIFO(&request_queue, conn_fd);
+}
+
 //
 // Initial handling of the request
 //
@@ -323,25 +332,32 @@ void request_handle(int fd) {
     struct stat sbuf;
     char buf[MAXBUF], method[MAXBUF], uri[MAXBUF], version[MAXBUF];
     char filename[MAXBUF], cgiargs[MAXBUF];
-    request_enqueue_FIFO(&request_queue, fd);
-
-/* struct stat statbuf;
-    if (fstat(fd, &statbuf) == 0) {
-        request_enqueue_SFF(&request_queue, fd, statbuf.st_size);
-    } */
-
-    //request_enqueue_random(&request_queue, fd);
     
-	// get the request type, file path and HTTP version
-    readline_or_die(fd, buf, MAXBUF);
-    sscanf(buf, "%s %s %s", method, uri, version);
-    printf("method:%s uri:%s version:%s\n", method, uri, version);
+    while (1) {
+        if (readline_or_die(fd, buf, MAXBUF) <= 0) {
+            request_error(fd, "read", "400", "Bad Request", "server could not read request");
+            return;
+        }
 
-	// verify if the request type is GET or not
+        printf("Received request: %s\n", buf);
+    
+        if (sscanf(buf, "%s %s %s", method, uri, version) == 3) {
+            break;
+        }
+    }
+
+    printf("method: %s | uri: %s | version: %s\n", method, uri, version);
+
     if (strcasecmp(method, "GET")) {
 		request_error(fd, method, "501", "Not Implemented", "server does not implement this method");
 		return;
     }
+
+    if (strstr(uri, "..")) {
+        request_error(fd, uri, "403", "Forbidden", "access denied due to directory traversal attempt");
+        return;
+    }
+
     request_read_headers(fd);
     
 	// check requested content type (static/dynamic)
@@ -362,18 +378,8 @@ void request_handle(int fd) {
 		
 		// TODO: write code to add HTTP requests in the buffer based on the scheduling policy
 
-        //FIFO scheduling implementation:
-        request_enqueue_FIFO(&request_queue, fd);
-
-        //SFF scheduling implementation:
-/*      struct stat statbuf;
-        if (fstat(fd, &statbuf) == 0) {
-            request_enqueue_SFF(&request_queue, fd, statbuf.st_size);
-        } */
-
-        //Random scheduling implementation:
-        //request_enqueue_random(&request_queue, fd);
-            
+        request_handle_enqueue(fd);
+           
     } else {
 		request_error(fd, filename, "501", "Not Implemented", "server does not serve dynamic content request");
     }
